@@ -1,0 +1,96 @@
+# Script Test: Stabilité VRAM PyTorch à 13.6GB (2x T4 Kaggle, 60s compute 100%)
+# Alloue 13.6GB par GPU, test de stabilité 60s, monitoring VRAM/%
+# Exécuter après relance kernel. Watch !nvidia-smi -l 1 pour VRAM/%
+import torch
+import gc
+import time
+import threading
+import os
+from traceback import format_exc
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+torch.backends.cudnn.enabled = True
+torch.backends.cudnn.benchmark = True
+num_gpus = 2
+gb_level = 13.6
+duration_s = 60
+def force_free_tensor(tensor_var):
+    if tensor_var is not None and tensor_var.is_cuda:
+        with torch.no_grad():
+            try:
+                temp_cpu = tensor_var.cpu()
+                del tensor_var
+                del temp_cpu
+                torch.cuda.synchronize()
+            except:
+                del tensor_var
+                for _ in range(5):
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+                    time.sleep(0.2)
+def ensure_clean(gpu_id):
+    torch.cuda.set_device(gpu_id)
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize(gpu_id)
+    gc.collect()
+def gpu_compute_loop(gpu_id, tensor, stop_event):
+    with torch.no_grad():
+        while not stop_event.is_set():
+            tensor.sin_()
+            tensor.mul_(tensor)
+            tensor.add_(1.0)
+            tensor.cos_()
+            tensor.exp_()
+def allocate_and_test(gb_level):
+    print(f"\n=== Test à {gb_level}GB pendant {duration_s}s ===")
+    tensors = [None] * num_gpus
+    try:
+        for gpu_id in range(num_gpus):
+            ensure_clean(gpu_id)
+            size_bytes = int(gb_level * 1024**3)
+            tensors[gpu_id] = torch.randn(size_bytes // 4, device=f'cuda:{gpu_id}', dtype=torch.float32)
+            used = torch.cuda.memory_allocated(gpu_id) / (1024**3)
+            print(f"GPU {gpu_id}: Alloué {used:.1f}GB")
+        if any(used < gb_level * 0.95 for used in [torch.cuda.memory_allocated(i) / (1024**3) for i in range(num_gpus)]):
+            raise RuntimeError("Allocation incomplète")
+        # Test stability 60s compute 100%
+        stop_event = threading.Event()
+        threads = []
+        for gpu_id in range(num_gpus):
+            t = threading.Thread(target=gpu_compute_loop, args=(gpu_id, tensors[gpu_id], stop_event))
+            t.start()
+            threads.append(t)
+        start_time = time.time()
+        while time.time() - start_time < duration_s:
+            elapsed = time.time() - start_time
+            used0 = torch.cuda.memory_allocated(0) / (1024**3)
+            used1 = torch.cuda.memory_allocated(1) / (1024**3)
+            try:
+                util0 = torch.cuda.utilization(0) if hasattr(torch.cuda, 'utilization') else 'N/A'
+                util1 = torch.cuda.utilization(1) if hasattr(torch.cuda, 'utilization') else 'N/A'
+                print(f" [{elapsed:.1f}s] GPU0: {used0:.1f}GB ({util0}%) | GPU1: {used1:.1f}GB ({util1}%)")
+            except:
+                print(f" [{elapsed:.1f}s] GPU0: {used0:.1f}GB | GPU1: {used1:.1f}GB")
+            time.sleep(1)
+        stop_event.set()
+        for t in threads:
+            t.join(timeout=1)
+        torch.cuda.synchronize()
+        print(f"✓ Stable à {gb_level}GB pendant {duration_s}s")
+        return True # Stable
+    except Exception as e:
+        print(f"✗ Échec à {gb_level}GB: {str(e)[:100]}...")
+        print(format_exc())
+        for gpu_id in range(num_gpus):
+            force_free_tensor(tensors[gpu_id])
+            ensure_clean(gpu_id)
+        return False # OOM ou fail
+    finally:
+        for gpu_id in range(num_gpus):
+            force_free_tensor(tensors[gpu_id])
+            ensure_clean(gpu_id)
+# Test execution
+print("=== TEST STABILITÉ VRAM PyTorch 2x T4 Kaggle à 13.6GB ===")
+stable = allocate_and_test(gb_level)
+print(f"\n=== RÉSULTAT ===")
+print(f"Stable: {'Oui' if stable else 'Non'} à {gb_level}GB pendant {duration_s}s (sur {num_gpus} GPUs)")
+print("Relance kernel pour reset VRAM.")
