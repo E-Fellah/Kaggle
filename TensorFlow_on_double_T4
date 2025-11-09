@@ -1,0 +1,90 @@
+# Script TensorFlow: 100% Compute à ~15GB peak VRAM (2x T4 Kaggle pendant 15s pile)
+# Tensor 4.8GB FP32 + graph scalar mul/add (temp 4.8GB, fast) pour FLOPS denses + soft clean no-reset
+# Exécuter après relance kernel. Watch !nvidia-smi -l 1 pour VRAM ~14.5-15GB osc + % 100% simultané
+import tensorflow as tf
+import time
+import os
+import threading
+import gc
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+os.environ['TF_GPU_ALLOCATOR'] = 'cuda_malloc_async'  # Async pour soft release
+
+gpus = tf.config.list_physical_devices('GPU')
+if len(gpus) < 2:
+    print("⚠️ Moins de 2 GPUs détectés – adapte le range(2) si besoin.")
+else:
+    for gpu in gpus:
+        tf.config.experimental.set_memory_growth(gpu, True)  # Growth only
+
+gb_level = 4.8  # Tensor 4.8GB FP32 (peak ~15GB titillé)
+size_bytes = int(gb_level * 1024**3)
+num_elements = size_bytes // 4  # FP32 : exactement 4.8GB
+print("=== Test TF ~15GB peak + 100% Compute 15s pile (graph scalar 4.8GB + soft clean) ===")
+tensors = []
+num_gpus = min(2, len(gpus))
+
+with tf.device('CPU:0'):
+    cpu_random = tf.random.normal([num_elements], dtype=tf.float32)
+
+for gpu_id in range(num_gpus):
+    try:
+        with tf.device(f'/GPU:{gpu_id}'):
+            tensors.append(tf.Variable(cpu_random))
+        used = tf.config.experimental.get_memory_info(f'GPU:{gpu_id}')['current'] / (1024**3)
+        print(f"GPU {gpu_id}: Alloué ~{used:.1f}GB")
+    except tf.errors.ResourceExhaustedError:
+        print(f"❌ OOM sur GPU {gpu_id} – drop à 4.5GB ?")
+        raise
+
+def gpu_compute_loop(gpu_id, tensor, done_event):
+    with tf.device(f'/GPU:{gpu_id}'):
+        @tf.function(experimental_relax_shapes=True)  # Graph fast
+        def compute_step(t):
+            return t * 1.0001 + 0.0001
+        loop_start = time.perf_counter()
+        success_iters = 0
+        while time.perf_counter() - loop_start < 15.0:  # Exact 15s wall time
+            try:
+                tensor.assign(compute_step(tensor))
+                success_iters += 1
+                if success_iters % 1000 == 0:  # Debug every 1000
+                    print(f"  GPU{gpu_id}: iter {success_iters} OK")
+            except tf.errors.ResourceExhaustedError:
+                print(f"⚠️ OOM sur iter ~{success_iters} GPU{gpu_id}")
+                break  # Stop thread si OOM
+        loop_time = time.perf_counter() - loop_start
+        # Force flush tensor (hack pour release)
+        tensor.assign(tf.zeros_like(tensor))
+        print(f"GPU {gpu_id}: {success_iters} iters (~15s) en {loop_time:.1f}s")
+        done_event.set()
+
+done_events = [threading.Event() for _ in range(num_gpus)]
+threads = []
+for gpu_id in range(num_gpus):
+    t = threading.Thread(target=lambda gid=gpu_id, ten=tensors[gpu_id], ev=done_events[gpu_id]: 
+                         gpu_compute_loop(gid, ten, ev))
+    t.start()
+    threads.append(t)
+
+# Monitor fixe 15s
+start_time = time.time()
+for _ in range(15):  # 15s pile
+    elapsed = time.time() - start_time
+    for gpu_id in range(num_gpus):
+        used = tf.config.experimental.get_memory_info(f'GPU:{gpu_id}')['current'] / (1024**3)
+        status = " (done)" if done_events[gpu_id].is_set() else ""
+        print(f" [{elapsed:.1f}s] GPU{gpu_id}: {used:.1f}GB{status}")
+    time.sleep(1)
+
+# Join + soft nettoyeur (no reset pour no restart)
+for t in threads:
+    t.join(timeout=5)  # Short post-15s
+del tensors
+tf.keras.backend.clear_session()
+gc.collect()
+time.sleep(2)  # Soft flush
+# No reset_memory pour éviter bounce kernel
+for gpu_id in range(num_gpus):
+    used = tf.config.experimental.get_memory_info(f'GPU:{gpu_id}')['current'] / (1024**3)
+    print(f"Post-soft GPU {gpu_id}: {used:.1f}GB (devrait ~0.0GB, idle – si collé, !nvidia-smi --gpu-reset manual)")
+print("✓ ~15GB peak + 100% 15s pile (4.8GB graph + soft clean) – dors bien !")
