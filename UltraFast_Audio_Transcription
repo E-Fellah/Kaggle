@@ -1,0 +1,335 @@
+# SCRIPT HYBRIDE ULTIME V3: FASTER WHISPER SUR 2 GPUs (Perfectionniste Edition !)
+# Améliorations pour TTS Voice Cloning:
+# - Segments ID de 1 à 25 (seg_1.wav, seg_1_transcript.json, etc.)
+# - Timestamps word-level ON (absolus cumulatifs pour alignement global)
+# - Dossier /transcriptions/ rempli: un JSON par segment avec full text + list de words [{"start":s, "end":e, "word":w}]
+# - Format TTS-ready: audio WAV + JSON timestamps (importable dans Tortoise/ElevenLabs/etc.)
+# - Transcript global TXT + JSON global pour backup
+# - RTF boosté, multi-GPU intact
+# - Installe: !pip install -q faster-whisper scipy torchaudio
+
+import os
+import gc
+import time
+import threading
+import shutil
+import torch
+import torchaudio
+import numpy as np
+import json
+from faster_whisper import WhisperModel
+from faster_whisper.utils import download_model  # Pour pre-download
+from queue import Queue
+from traceback import format_exc
+from scipy.io import wavfile
+import warnings
+warnings.filterwarnings("ignore")
+
+# Désactiver TQDM et config PyTorch pour stabilité
+os.environ['TQDM_DISABLE'] = '1'
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+torch.backends.cudnn.enabled = True
+torch.backends.cudnn.benchmark = True
+
+# Config
+num_gpus = 2
+num_segments = 25  # Fixe comme Script 2
+gpu_ids = list(range(num_gpus))
+audio_path = '/kaggle/input/d/abdallahiyoucef/rdj-voice/RDJ_Voice.mp3'
+sr = 16000
+model_size = "large-v3"  # Explicit pour download (large = v3)
+
+# Dossiers output
+transcriptions_dir = '/kaggle/working/transcriptions'
+segments_dir = '/kaggle/working/segments'
+os.makedirs(transcriptions_dir, exist_ok=True)
+os.makedirs(segments_dir, exist_ok=True)
+
+def ensure_clean(gpu_id):
+    if torch.cuda.is_available():
+        torch.cuda.set_device(gpu_id)
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize(gpu_id)
+    gc.collect()
+
+def force_free_model(model):
+    if model is not None:
+        del model
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        gc.collect()
+
+def load_and_split_audio_fixed(audio_path, num_segments=25, sr=16000):
+    """Découpage fixe en N segments égaux (comme Script 2)"""
+    print("Load et découpage fixe audio...")
+    waveform, sample_rate = torchaudio.load(audio_path)
+    if sample_rate != sr:
+        resampler = torchaudio.transforms.Resample(sample_rate, sr)
+        waveform = resampler(waveform)
+    audio_np = waveform.squeeze().numpy().astype(np.float32)
+    if np.max(np.abs(audio_np)) > 1.0:
+        audio_np /= np.max(np.abs(audio_np))
+    audio_torch = torch.from_numpy(audio_np).float()
+    
+    total_samples = len(audio_torch)
+    segment_len_samples = total_samples // num_segments
+    segments = []
+    offsets = []  # Cumul offset en secondes pour timestamps absolus
+    current_offset = 0.0
+    for i in range(num_segments):
+        start = i * segment_len_samples
+        end = (i + 1) * segment_len_samples if i < num_segments - 1 else total_samples
+        seg = audio_torch[start:end]
+        if len(seg) > 0:
+            segments.append(seg)
+            offsets.append(current_offset)
+            current_offset += len(seg) / sr
+    print(f"Audio découpé en {len(segments)} segments fixes de ~{total_samples / sr / num_segments:.1f}s chacun.")
+    return segments, sr, offsets  # Ajout offsets pour timestamps globaux
+
+def save_segments_to_wav(segments, sr, segments_dir, start_id=1):
+    """Save segments to output WAV with scipy (ID de 1 à N)"""
+    saved_count = 0
+    for idx, seg in enumerate(segments):
+        seg_id = idx + start_id  # 1-based
+        path = os.path.join(segments_dir, f'seg_{seg_id}.wav')
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        seg_np = (seg.numpy() * 32767).astype(np.int16)
+        try:
+            wavfile.write(path, sr, seg_np)
+            saved_count += 1
+            print(f"Saved seg {seg_id} to {path}")
+        except Exception as e:
+            print(f"Erreur save seg {seg_id}: {str(e)} – Skip")
+    print(f"✓ {saved_count}/{len(segments)} segments saved to {segments_dir}")
+
+def save_segment_transcript(seg_id, text, word_segments, offset, transcriptions_dir):
+    """Save per-segment JSON: text + word-level timestamps (absolus) pour TTS"""
+    transcript_path = os.path.join(transcriptions_dir, f'seg_{seg_id}_transcript.json')
+    os.makedirs(os.path.dirname(transcript_path), exist_ok=True)
+    # Convertir word_segments en list avec timestamps absolus
+    timed_words = []
+    for ws in word_segments:
+        abs_start = offset + ws.start
+        abs_end = offset + ws.end
+        timed_words.append({
+            "start": round(abs_start, 2),
+            "end": round(abs_end, 2),
+            "word": ws.word.strip()
+        })
+    data = {
+        "segment_id": seg_id,
+        "full_text": text,
+        "words": timed_words,
+        "segment_offset": round(offset, 2),
+        "duration": round(len(word_segments) > 0 and (word_segments[-1].end - word_segments[0].start) or 0, 2)
+    }
+    try:
+        with open(transcript_path, 'w') as f:
+            json.dump(data, f, indent=2)
+        print(f"✓ Saved {transcript_path} (TTS-ready: {len(timed_words)} words)")
+    except Exception as e:
+        print(f"Erreur save {transcript_path}: {str(e)} – Data: {data}")
+
+def worker(gpu_id, q, stop_event, results_dict, lock, model_path, offsets):
+    """Worker par GPU: Faster Whisper avec word_timestamps=True"""
+    torch.cuda.set_device(gpu_id)
+    ensure_clean(gpu_id)
+    model = None
+    processed = 0
+    transcribe_time = 0.0
+    try:
+        # Load Faster Whisper depuis path local sur ce GPU (float16 pour vitesse)
+        model = WhisperModel(model_path, device="cuda", device_index=gpu_id, compute_type="float16")
+        print(f"GPU {gpu_id}: Modèle Faster Whisper chargé")
+        
+        used_model = torch.cuda.memory_allocated(gpu_id) / (1024**3)
+        print(f"GPU {gpu_id}: Total alloué {used_model:.1f}GB (efficace, pas de dummy needed)")
+        
+        while not stop_event.is_set():
+            try:
+                item = q.get(timeout=1)
+            except:
+                if q.empty():
+                    break
+                continue
+            if item is None:
+                break
+            seg_idx, seg = item  # seg_idx 0-based pour offset
+            seg_id = seg_idx + 1  # 1-based pour fichiers
+            offset = offsets[seg_idx]
+            try:
+                seg_start = time.time()
+                seg_np = seg.numpy().astype(np.float32)
+                
+                # Transcription avec word_timestamps=True pour TTS alignement
+                segments_gen, info = model.transcribe(
+                    seg_np,
+                    beam_size=1,
+                    language='en',
+                    vad_filter=False,
+                    temperature=0.0,
+                    word_timestamps=True  # ON pour timestamps word-level !
+                )
+                full_text = ' '.join(s.text.strip() for s in segments_gen if s.text.strip())
+                word_segments = []  # Collect all words across sub-segments
+                for s in segments_gen:
+                    for word in s.words:
+                        word_segments.append(word)
+                delta_time = time.time() - seg_start
+                transcribe_time += delta_time
+
+                if full_text:
+                    with lock:
+                        results_dict[seg_id] = (full_text, word_segments)
+                    print(f"GPU {gpu_id} - Segment {seg_id}: {full_text[:100]}... (time: {delta_time:.2f}s, {len(word_segments)} words)")
+                    processed += 1
+                else:
+                    print(f"GPU {gpu_id} - Segment {seg_id}: Vide – Skip")
+
+                # Check VRAM après
+                total_used = torch.cuda.memory_allocated(gpu_id) / (1024**3)
+                print(f"GPU {gpu_id}: Après seg {seg_id}, total {total_used:.1f}GB")
+                
+                del seg_np, segments_gen, info, full_text
+                torch.cuda.synchronize(gpu_id)
+                
+                # Nettoyage si >14GB
+                if total_used > 14.0:
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize(gpu_id)
+                gc.collect()
+                
+                q.task_done()
+            except Exception as e:
+                print(f"Erreur transcription seg {seg_id} sur GPU {gpu_id}: {str(e)[:100]}")
+                print(format_exc())
+                q.task_done()
+        print(f"GPU {gpu_id}: {processed} segments traités | Total transcribe time: {transcribe_time:.1f}s")
+    except Exception as e:
+        print(f"Erreur dans worker GPU {gpu_id}: {str(e)}")
+        print(format_exc())
+    finally:
+        force_free_model(model)
+        ensure_clean(gpu_id)
+        stop_event.set()
+
+# Nettoyage initial Kaggle
+print("Nettoyage des dossiers de sortie Kaggle...")
+try:
+    shutil.rmtree('/kaggle/working', ignore_errors=True)
+except Exception as e:
+    print(f"Erreur lors du rmtree: {e}")
+os.makedirs('/kaggle/working', exist_ok=True)
+print("✓ Nettoyage terminé.")
+
+# Global timing
+global_start = time.time()
+print(f"Début à {time.strftime('%H:%M:%S')}")
+
+# PRE-DOWNLOAD MODEL
+print("Téléchargement du modèle Faster Whisper large-v3 (une fois, ~2.5GB)...")
+try:
+    model_path = download_model(model_size)
+    print(f"✓ Modèle téléchargé vers {model_path}")
+except Exception as e:
+    print(f"Erreur download: {e} – Retry sans disable TQDM?")
+    os.environ['TQDM_DISABLE'] = '0'
+    model_path = download_model(model_size)
+    os.environ['TQDM_DISABLE'] = '1'
+    print(f"✓ Modèle téléchargé (fallback) vers {model_path}")
+
+# Load et split audio (avec offsets)
+segments, sr, offsets = load_and_split_audio_fixed(audio_path, num_segments=num_segments)
+num_segments = len(segments)
+print(f"Final: {num_segments} segments (offsets calculés pour timestamps absolus).")
+
+# Save segments WAV (1-based)
+save_segments_to_wav(segments, sr, segments_dir, start_id=1)
+
+# Queue pour segments (0-based idx pour offset)
+q = Queue()
+for seg_idx, seg in enumerate(segments):
+    q.put((seg_idx, seg))
+
+# Results dict partagé + lock (seg_id 1-based -> (text, word_segments))
+results_dict = {}
+lock = threading.Lock()
+
+# Lancement workers
+print(f"Lancement de {num_gpus} workers Faster Whisper sur GPUs (word_timestamps=ON)...")
+print("Surveille !nvidia-smi -l 1 : attends ~6-8GB VRAM/GPU, util 80-100% burst.")
+stop_event = threading.Event()
+threads = []
+for gpu_id in gpu_ids:
+    t = threading.Thread(target=worker, args=(gpu_id, q, stop_event, results_dict, lock, model_path, offsets))
+    t.daemon = True
+    t.start()
+    threads.append(t)
+
+# Attente
+q.join()
+
+# Arrêt
+for _ in range(num_gpus):
+    q.put(None)
+for t in threads:
+    t.join(timeout=10)
+
+# Nettoyage final
+gc.collect()
+for gpu_id in gpu_ids:
+    ensure_clean(gpu_id)
+torch.cuda.empty_cache()
+
+# Save per-segment transcripts (TTS-ready)
+print("\nSauvegarde des transcripts par segment (JSON avec timestamps)...")
+for seg_id in sorted(results_dict):
+    text, word_segments = results_dict[seg_id]
+    offset = offsets[seg_id - 1]  # 0-based offset
+    save_segment_transcript(seg_id, text, word_segments, offset, transcriptions_dir)
+
+# Global transcript TXT + JSON
+full_text = ' '.join([results_dict[i][0] for i in sorted(results_dict)])
+full_words = []
+current_offset = 0.0
+for seg_id in sorted(results_dict):
+    text, word_segments = results_dict[seg_id]
+    offset = offsets[seg_id - 1]
+    for ws in word_segments:
+        abs_start = offset + ws.start
+        abs_end = offset + ws.end
+        full_words.append({
+            "start": round(abs_start, 2),
+            "end": round(abs_end, 2),
+            "word": ws.word.strip()
+        })
+global_data = {
+    "total_segments": num_segments,
+    "full_text": full_text,
+    "words": full_words,
+    "total_duration": round(offsets[-1] if offsets else 0, 2)
+}
+print(f"\nTranscript complet ({len(results_dict)}/{num_segments} segs, {len(full_text)} chars):\n{full_text[:500]}...\n[Per-segment JSONs in {transcriptions_dir}/]")
+
+# Save global
+try:
+    os.makedirs(transcriptions_dir, exist_ok=True)
+    with open(os.path.join(transcriptions_dir, 'global_transcript.txt'), 'w') as f:
+        f.write(full_text)
+    with open(os.path.join(transcriptions_dir, 'global_transcript.json'), 'w') as f:
+        json.dump(global_data, f, indent=2)
+    print(f"✓ Global TXT & JSON saved to {transcriptions_dir}/")
+except Exception as e:
+    print(f"Erreur save global: {str(e)} – Full text ci-dessous:")
+    print(f"\n=== FULL TRANSCRIPT ({len(full_text)} chars) ===\n{full_text}\n=== END ===")
+print(f"✓ Audio segments in {segments_dir} (seg_1.wav à seg_25.wav, download via Kaggle).")
+print(f"✓ Dossier {transcriptions_dir} rempli: 25 JSONs TTS-ready + globals !")
+
+total_time = time.time() - global_start
+total_samples = sum(len(s) for s in segments)
+audio_duration_s = total_samples / sr
+rtf = audio_duration_s / total_time if total_time > 0 else 0
+print(f"\n✓ Fini en {total_time:.1f}s (~{total_time / num_segments:.1f}s/seg, RTF {rtf:.0f}x pour ~{audio_duration_s/60:.1f}min audio).")
+print("Perfectionniste mode ON ! Timestamps absolus pour Voice Cloning direct (importe les JSONs dans ton TTS tool). Dossier transcripts blindé, segs à 1-25. Next: fine-tune ou autre ? 🚀")
